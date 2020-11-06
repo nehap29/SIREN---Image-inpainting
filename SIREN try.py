@@ -16,7 +16,7 @@ import numpy as np
 import skimage
 import matplotlib.pyplot as plt
 import scipy.ndimage
-
+from cv2 import imread
 import time
 
 def get_mgrid(sidelen, dim=2):
@@ -168,8 +168,131 @@ def get_cameraman_tensor(sidelength):
     img = transform(img)
     return img
 
+def get_brick_tensor(sidelength):
+    img = Image.fromarray(skimage.data.brick())        
+    transform = Compose([
+        Resize(sidelength),
+        ToTensor(),
+        Normalize(torch.Tensor([0.5]), torch.Tensor([0.5]))
+    ])
+    img = transform(img)
+    return img
+
 
 # In[5]:
+
+
+class CompositeGradients(Dataset):
+    def __init__(self, img_filepath1, img_filepath2,
+                 sidelength=None,
+                 is_color=False):
+        super().__init__()
+
+        #if isinstance(sidelength, int):
+          #  sidelength = (sidelength, sidelength)
+
+        self.is_color = is_color
+        if (self.is_color):
+            self.channels = 3
+        else:
+            self.channels = 1
+
+        self.img1 = Image.open(img_filepath1)
+        self.img2 = Image.open(img_filepath2)
+
+        if not self.is_color:
+            self.img1 = self.img1.convert("L")
+            self.img2 = self.img2.convert("L")
+        else:
+            self.img1 = self.img1.convert("RGB")
+            self.img2 = self.img2.convert("RGB")
+
+        self.transform = Compose([
+            ToTensor(),
+            Normalize(torch.Tensor([0.5]), torch.Tensor([0.5]))
+        ])
+        self.img1 = self.img1.resize((sidelength, sidelength))
+        self.img2 = self.img2.resize((sidelength, sidelength))
+        
+        self.mgrid = get_mgrid(int(sidelength),2)
+
+        self.img1 = self.transform(self.img1)
+        self.img2 = self.transform(self.img2)
+
+        paddedImg = .85 * torch.ones_like(self.img1)
+        print(self.img1.numpy().shape)
+        print(self.img2.numpy().shape)
+        paddedImg[:, self.img1.shape[1] - self.img2.shape[1]:self.img1.shape[1], :] = self.img2
+        self.img2 = paddedImg
+
+        self.grads1 = self.compute_gradients(self.img1)
+        self.grads2 = self.compute_gradients(self.img2)
+
+        self.comp_grads = (.5 * self.grads1 + .5 * self.grads2)
+
+        self.img1 = self.img1.permute(1, 2, 0).view(-1, self.channels)
+        self.img2 = self.img2.permute(1, 2, 0).view(-1, self.channels)
+
+    def compute_gradients(self, img):
+        if not self.is_color:
+            gradx = scipy.ndimage.sobel(img.numpy(), axis=1).squeeze(0)[..., None]
+            grady = scipy.ndimage.sobel(img.numpy(), axis=2).squeeze(0)[..., None]
+        else:
+            gradx = np.moveaxis(scipy.ndimage.sobel(img.numpy(), axis=1), 0, -1)
+            grady = np.moveaxis(scipy.ndimage.sobel(img.numpy(), axis=2), 0, -1)
+
+        grads = torch.cat((torch.from_numpy(gradx).reshape(-1, self.channels),
+                           torch.from_numpy(grady).reshape(-1, self.channels)),
+                          dim=-1)
+        return grads
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, idx):
+        in_dict = {'idx': idx, 'pixels': self.mgrid}
+        gt_dict = {'img1': self.img1,
+                   'img2': self.img2,
+                   'grads1': self.grads1,
+                   'grads2': self.grads2,
+                   'grads': self.comp_grads}
+
+        return in_dict['pixels'], gt_dict
+
+
+# In[6]:
+
+
+
+    
+class PoissonCustomEqn(Dataset):
+    def __init__(self, sidelength, path_1, path_2):
+        super().__init__()
+        img_1 = get_img_tensor(path_1,sidelength)
+        img_2 = get_img_tensor(path_2,int(sidelength/2))
+        print(img_1.numpy().shape)
+        print(img_2.numpy().shape)
+        
+        # Compute gradient and laplacian
+        grads_x = scipy.ndimage.sobel(img.numpy(), axis=1).squeeze(0)[..., None]
+        grads_y = scipy.ndimage.sobel(img.numpy(), axis=2).squeeze(0)[..., None]
+        grads_x, grads_y = torch.from_numpy(grads_x), torch.from_numpy(grads_y)
+                
+        self.grads = torch.stack((grads_x, grads_y), dim=-1).view(-1, 2)
+        self.laplace = scipy.ndimage.laplace(img_1.numpy()).squeeze(0)[..., None]
+        self.laplace = torch.from_numpy(self.laplace)
+        
+        self.pixels = img.permute(1, 2, 0).view(-1, 1)
+        self.coords = get_mgrid(sidelength, 2)
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, idx):
+        return self.coords, {'pixels':self.pixels, 'grads':self.grads, 'laplace':self.laplace}
+
+
+# In[7]:
 
 
 class ImageFitting(Dataset):
@@ -188,90 +311,20 @@ class ImageFitting(Dataset):
         return self.coords, self.pixels
 
 
-# In[6]:
+# In[8]:
 
 
-cameraman = ImageFitting(256)
-dataloader = DataLoader(cameraman, batch_size=1, pin_memory=True, num_workers=0)
-
-img_siren = Siren(in_features=2, out_features=1, hidden_features=256, 
-                  hidden_layers=3, outermost_linear=True)
-#img_siren.cuda()
-
-
-# In[ ]:
-
-
-total_steps = 500 # Since the whole image is our dataset, this just means 500 gradient descent steps.
-steps_til_summary = 100
-
-optim = torch.optim.Adam(lr=1e-4, params=img_siren.parameters())
-
-model_input, ground_truth = next(iter(dataloader))
-#model_input, ground_truth = model_input.cuda(), ground_truth.cuda()
-
-for step in range(total_steps):
-    model_output, coords = img_siren(model_input)    
-    loss = ((model_output - ground_truth)**2).mean()
-    
-    if not step % steps_til_summary:
-        print("Step %d, Total loss %0.6f" % (step, loss))
-        img_grad = gradient(model_output, coords)
-        img_laplacian = laplace(model_output, coords)
-
-        fig, axes = plt.subplots(1,3, figsize=(18,6))
-        axes[0].imshow(model_output.cpu().view(256,256).detach().numpy())
-        axes[1].imshow(img_grad.norm(dim=-1).cpu().view(256,256).detach().numpy())
-        axes[2].imshow(img_laplacian.cpu().view(256,256).detach().numpy())
-        plt.show()
-
-    optim.zero_grad()
-    loss.backward()
-    optim.step()
-
-
-# In[ ]:
-
-
-class PoissonEqn(Dataset):
-    def __init__(self, sidelength):
-        super().__init__()
-        img = get_cameraman_tensor(sidelength)
-        
-        # Compute gradient and laplacian       
-        grads_x = scipy.ndimage.sobel(img.numpy(), axis=1).squeeze(0)[..., None]
-        grads_y = scipy.ndimage.sobel(img.numpy(), axis=2).squeeze(0)[..., None]
-        grads_x, grads_y = torch.from_numpy(grads_x), torch.from_numpy(grads_y)
-                
-        self.grads = torch.stack((grads_x, grads_y), dim=-1).view(-1, 2)
-        self.laplace = scipy.ndimage.laplace(img.numpy()).squeeze(0)[..., None]
-        self.laplace = torch.from_numpy(self.laplace)
-        
-        self.pixels = img.permute(1, 2, 0).view(-1, 1)
-        self.coords = get_mgrid(sidelength, 2)
-
-    def __len__(self):
-        return 1
-
-    def __getitem__(self, idx):
-        return self.coords, {'pixels':self.pixels, 'grads':self.grads, 'laplace':self.laplace}
-
-
-# In[ ]:
-
-
-cameraman_poisson = PoissonEqn(128)
+cameraman_poisson = CompositeGradients('room.jpg','sofa.jpg',is_color=False, sidelength=512)
 dataloader = DataLoader(cameraman_poisson, batch_size=1, pin_memory=True, num_workers=0)
 
 poisson_siren = Siren(in_features=2, out_features=1, hidden_features=256, 
                       hidden_layers=3, outermost_linear=True)
-poisson_siren.cuda()
 
 
 # In[ ]:
 
 
-def gradients_mse(model_output, coords, gt_gradients):
+def gradients_mse(model_output, coords, gt_gradients, model=None):
     # compute gradients on the model
     gradients = gradient(model_output, coords)
     # compare them with the ground-truth
@@ -282,14 +335,13 @@ def gradients_mse(model_output, coords, gt_gradients):
 # In[ ]:
 
 
-total_steps = 1000
+total_steps = 500
 steps_til_summary = 10
 
 optim = torch.optim.Adam(lr=1e-4, params=poisson_siren.parameters())
 
 model_input, gt = next(iter(dataloader))
-gt = {key: value.cuda() for key, value in gt.items()}
-model_input = model_input.cuda()
+gt = {key: value.cpu() for key, value in gt.items()}
 
 for step in range(total_steps):
     start_time = time.time()
@@ -299,19 +351,26 @@ for step in range(total_steps):
 
     if not step % steps_til_summary:
         print("Step %d, Total loss %0.6f, iteration time %0.6f" % (step, train_loss, time.time() - start_time))
-
         img_grad = gradient(model_output, coords)
         img_laplacian = laplace(model_output, coords)
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         axes[0].imshow(model_output.cpu().view(128,128).detach().numpy())
         axes[1].imshow(img_grad.cpu().norm(dim=-1).view(128,128).detach().numpy())
-        axes[2].imshow(img_laplacian.cpu().view(128,128).detach().numpy())
+        #axes[2].imshow(img_laplacian.cpu().view(128,128).detach().numpy())
         plt.show()
-        
     optim.zero_grad()
     train_loss.backward()
     optim.step()
+
+img_grad = gradient(model_output, coords)
+img_laplacian = laplace(model_output, coords)
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+axes[0].imshow(model_output.cpu().view(128,128).detach().numpy())
+axes[1].imshow(img_grad.cpu().norm(dim=-1).view(128,128).detach().numpy())
+axes[2].imshow(img_laplacian.cpu().view(128,128).detach().numpy())
+plt.show()
 
 
 # In[ ]:
